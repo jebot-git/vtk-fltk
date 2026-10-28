@@ -1,159 +1,263 @@
 // SPDX-License-Identifier: MIT
-#define GL_GLEXT_PROTOTYPES
-#include <FL/Fl.H>
-#include <FL/Fl_Gl_Window.H>
-#include <FL/gl.h>
+#include "suite/desktop-menu.h"
+#include "suite/gpu-window.h"
+#include <FL/Fl_Button.H>
+#include <FL/Fl_File_Chooser.H>
+#include <FL/Fl_Menu_Button.H>
+#include <FL/fl_ask.H>
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <memory>
+#include <stdexcept>
 #include <string>
-#include <vector>
+#include <vtk-fltk/RenderWidget.h>
 #include <vtkActor.h>
-#include <vtkAutoInit.h>
-#include <vtkCallbackCommand.h>
 #include <vtkCamera.h>
 #include <vtkConeSource.h>
+#include <vtkDataSet.h>
+#include <vtkDataSetMapper.h>
+#include <vtkGenericDataObjectReader.h>
 #include <vtkGenericOpenGLRenderWindow.h>
-#include <vtkGenericRenderWindowInteractor.h>
-#include <vtkInteractorStyleTrackballCamera.h>
 #include <vtkNew.h>
-#include <vtkOpenGLState.h>
-#include <vtkPolyDataMapper.h>
+#include <vtkOBJReader.h>
+#include <vtkPLYReader.h>
 #include <vtkProperty.h>
-#include <vtkRenderWindowInteractor.h>
 #include <vtkRenderer.h>
-VTK_MODULE_INIT(vtkRenderingOpenGL2);
-class Window : public Fl_Gl_Window {
-  vtkNew<vtkGenericOpenGLRenderWindow> renderWindow;
+#include <vtkSTLReader.h>
+#include <vtkSmartPointer.h>
+#include <vtkXMLGenericDataObjectReader.h>
+namespace {
+struct ViewerWindow : dx::GpuWindow {
+  using dx::GpuWindow::GpuWindow;
+  std::function<bool()> key;
+  int handle(int event) override {
+    if ((event == FL_KEYDOWN || event == FL_SHORTCUT) && key && key())
+      return 1;
+    return dx::GpuWindow::handle(event);
+  }
+};
+struct Viewer {
+  ViewerWindow window{900, 660, "VTK FLTK"};
+  vtk_fltk::RenderWidget view{0, 52, 900, 608};
+  Fl_Menu_Bar menu{0, 0, 0, 0};
   vtkNew<vtkRenderer> renderer;
-  vtkNew<vtkGenericRenderWindowInteractor> interactor;
-  vtkNew<vtkInteractorStyleTrackballCamera> style;
-  vtkNew<vtkCallbackCommand> callback;
-  bool initialized = false, captured = false;
-
-public:
-  std::string capture;
-  Window() : Fl_Gl_Window(640, 480, "VTK with system FLTK") {
-    mode(FL_RGB | FL_DOUBLE | FL_DEPTH | FL_OPENGL3);
-    end();
-    resizable(this);
-    renderWindow->SetOwnContext(false);
-    renderWindow->SetReadyForRendering(true);
-    renderWindow->SetSwapBuffers(true);
-    renderWindow->SetFrameBlitModeToNoBlit();
-    callback->SetClientData(this);
-    callback->SetCallback(
-        [](vtkObject *, unsigned long event, void *data, void *call) {
-          auto *self = static_cast<Window *>(data);
-          if (event == vtkCommand::WindowMakeCurrentEvent)
-            self->make_current();
-          else if (event == vtkCommand::WindowIsCurrentEvent)
-            *static_cast<bool *>(call) = true;
-          else if (event == vtkCommand::WindowSupportsOpenGLEvent ||
-                   event == vtkCommand::WindowIsDirectEvent)
-            *static_cast<int *>(call) = 1;
-        });
-    for (auto event :
-         {vtkCommand::WindowMakeCurrentEvent, vtkCommand::WindowIsCurrentEvent,
-          vtkCommand::WindowSupportsOpenGLEvent,
-          vtkCommand::WindowIsDirectEvent})
-      renderWindow->AddObserver(event, callback);
-    vtkNew<vtkConeSource> cone;
-    cone->SetResolution(32);
-    vtkNew<vtkPolyDataMapper> mapper;
-    mapper->SetInputConnection(cone->GetOutputPort());
-    vtkNew<vtkActor> actor;
+  vtkNew<vtkActor> actor;
+  vtkNew<vtkDataSetMapper> mapper;
+  std::unique_ptr<DesktopMenu> desktop;
+  std::string report_path;
+  enum Command { Open, Reset, Wireframe, Quit };
+  Viewer() {
+    window.callback(
+        [](Fl_Widget *, void *data) { static_cast<Viewer *>(data)->close(); },
+        this);
+    window.key = [this] {
+      int key = Fl::event_key(), state = Fl::event_state();
+      if (state & (FL_ALT | FL_META))
+        return false;
+      if ((state & FL_CTRL) && key == 'o')
+        command(Open);
+      else if ((state & FL_CTRL) && key == 'w')
+        command(Quit);
+      else if (!(state & FL_CTRL) && key == 'w')
+        command(Wireframe);
+      else if (!(state & FL_CTRL) && key == 'r')
+        command(Reset);
+      else
+        return false;
+      return true;
+    };
+    menu.hide();
+    menu.add("&File/&Open", FL_CTRL + 'o', invoke,
+             reinterpret_cast<void *>(Open));
+    menu.add("&File/&Close", FL_CTRL + 'w', invoke,
+             reinterpret_cast<void *>(Quit));
+    menu.add("&View/&Reset camera", 'r', invoke,
+             reinterpret_cast<void *>(Reset));
+    menu.add("&View/&Wireframe", 'w', invoke,
+             reinterpret_cast<void *>(Wireframe));
+    menu.user_data(this);
+    auto *popup = new Fl_Menu_Button(12, 10, 90, 32, "Menu");
+    popup->copy(menu.menu());
+    popup->user_data(this);
+    if (dx::dome())
+      popup->hide();
+    for (auto [label, command, x] :
+         {std::tuple{"Open", Open, 112}, std::tuple{"Reset view", Reset, 212},
+          std::tuple{"Wireframe", Wireframe, 322}}) {
+      auto *button = new Fl_Button(x, 10, 100, 32, label);
+      button->callback(
+          [](Fl_Widget *w, void *p) {
+            static_cast<Viewer *>(w->window()->user_data())
+                ->command(Command(reinterpret_cast<intptr_t>(p)));
+          },
+          reinterpret_cast<void *>(command));
+    }
+    window.user_data(this);
+    window.end();
+    window.resizable(view);
+    unsigned char r, g, b;
+    Fl::get_color(FL_BACKGROUND2_COLOR, r, g, b);
+    renderer->SetBackground(r / 255., g / 255., b / 255.);
     actor->SetMapper(mapper);
     actor->GetProperty()->SetColor(.95, .65, .15);
     renderer->AddActor(actor);
-    renderer->SetBackground(.08, .11, .16);
+    view.render_window()->AddRenderer(renderer);
+    vtkNew<vtkConeSource> cone;
+    cone->SetResolution(48);
+    cone->Update();
+    mapper->SetInputData(cone->GetOutput());
     renderer->ResetCamera();
-    renderWindow->AddRenderer(renderer);
-    interactor->SetRenderWindow(renderWindow);
-    interactor->SetInteractorStyle(style);
-    interactor->EnableRenderOff();
   }
-  ~Window() {
-    if (shown())
-      hide();
+  ~Viewer() { close(); }
+  void close() {
+    view.hide();
+    window.hide();
   }
-  void hide() override {
-    if (initialized) {
-      make_current();
-      renderWindow->Finalize();
-      initialized = false;
-    }
-    Fl_Gl_Window::hide();
+  static void invoke(Fl_Widget *w, void *p) {
+    auto *source = dynamic_cast<Fl_Menu_ *>(w);
+    auto *self = static_cast<Viewer *>(source->user_data());
+    self->command(Command(reinterpret_cast<intptr_t>(p)));
   }
-  void draw() override {
-    if (!initialized) {
-      renderWindow->OpenGLInitContext();
-      interactor->Initialize();
-      initialized = true;
-      std::cout << "Renderer: " << glGetString(GL_RENDERER) << std::endl;
-    }
-    renderWindow->GetState()->Reset();
-    renderWindow->SetSize(pixel_w(), pixel_h());
-    interactor->SetSize(pixel_w(), pixel_h());
-    renderWindow->Render();
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-    glDrawBuffer(GL_BACK);
-    renderWindow->BlitDisplayFramebuffer();
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    glReadBuffer(GL_BACK);
-    if (!capture.empty() && !captured) {
-      std::vector<unsigned char> data(pixel_w() * pixel_h() * 3);
-      glPixelStorei(GL_PACK_ALIGNMENT, 1);
-      glReadPixels(0, 0, pixel_w(), pixel_h(), GL_RGB, GL_UNSIGNED_BYTE,
-                   data.data());
-      auto [low, high] = std::minmax_element(data.begin(), data.end());
-      if (*high - *low < 100)
-        throw std::runtime_error("VTK output has no rendered geometry");
-      std::ofstream out(capture, std::ios::binary);
-      out << "P6\n" << pixel_w() << " " << pixel_h() << "\n255\n";
-      for (int y = pixel_h() - 1; y >= 0; --y)
-        out.write(reinterpret_cast<char *>(data.data() + y * pixel_w() * 3),
-                  pixel_w() * 3);
-      captured = true;
-      std::cout << "PASS VTK rendered geometry into the FLTK OpenGL context"
-                << std::endl;
+  void command(Command cmd) {
+    try {
+      if (cmd == Open) {
+        const char *file =
+            fl_file_chooser("Open VTK geometry",
+                            "*.{vtk,vtp,vtu,vti,vtr,vts,stl,obj,ply}", nullptr);
+        if (file)
+          load(file);
+      } else if (cmd == Reset)
+        renderer->ResetCamera();
+      else if (cmd == Wireframe) {
+        auto *p = actor->GetProperty();
+        p->SetRepresentation(p->GetRepresentation() == VTK_WIREFRAME
+                                 ? VTK_SURFACE
+                                 : VTK_WIREFRAME);
+      } else if (cmd == Quit)
+        close();
+      view.redraw();
+    } catch (const std::exception &e) {
+      fl_alert("%s", e.what());
     }
   }
-  int handle(int event) override {
-    if (event == FL_PUSH || event == FL_RELEASE || event == FL_DRAG ||
-        event == FL_MOVE || event == FL_MOUSEWHEEL) {
-      interactor->SetEventInformationFlipY(Fl::event_x(), Fl::event_y(),
-                                           Fl::event_state(FL_CTRL),
-                                           Fl::event_state(FL_SHIFT));
-      if (event == FL_PUSH)
-        interactor->InvokeEvent(
-            Fl::event_button() == 1   ? vtkCommand::LeftButtonPressEvent
-            : Fl::event_button() == 2 ? vtkCommand::MiddleButtonPressEvent
-                                      : vtkCommand::RightButtonPressEvent);
-      else if (event == FL_RELEASE)
-        interactor->InvokeEvent(
-            Fl::event_button() == 1   ? vtkCommand::LeftButtonReleaseEvent
-            : Fl::event_button() == 2 ? vtkCommand::MiddleButtonReleaseEvent
-                                      : vtkCommand::RightButtonReleaseEvent);
-      else if (event == FL_MOUSEWHEEL)
-        interactor->InvokeEvent(Fl::event_dy() < 0
-                                    ? vtkCommand::MouseWheelForwardEvent
-                                    : vtkCommand::MouseWheelBackwardEvent);
-      else
-        interactor->InvokeEvent(vtkCommand::MouseMoveEvent);
-      redraw();
-      return 1;
+  template <class Reader>
+  vtkSmartPointer<vtkDataSet> read(const std::string &path) {
+    vtkNew<Reader> reader;
+    reader->SetFileName(path.c_str());
+    reader->Update();
+    auto *data = vtkDataSet::SafeDownCast(reader->GetOutputDataObject(0));
+    if (reader->GetErrorCode() != 0 || !data || data->GetNumberOfPoints() == 0)
+      throw std::runtime_error("No readable dataset geometry in " + path);
+    return data;
+  }
+  void load(const std::string &path) {
+    auto extension = std::filesystem::path(path).extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    vtkSmartPointer<vtkDataSet> data;
+    if (extension == ".vtk")
+      data = read<vtkGenericDataObjectReader>(path);
+    else if (extension == ".stl")
+      data = read<vtkSTLReader>(path);
+    else if (extension == ".ply")
+      data = read<vtkPLYReader>(path);
+    else if (extension == ".obj")
+      data = read<vtkOBJReader>(path);
+    else if (extension == ".vtp" || extension == ".vtu" ||
+             extension == ".vti" || extension == ".vtr" || extension == ".vts")
+      data = read<vtkXMLGenericDataObjectReader>(path);
+    else
+      throw std::runtime_error(
+          "Supported files: VTK, VTP/VTU/VTI/VTR/VTS, STL, OBJ and PLY");
+    mapper->SetInputData(data);
+    renderer->ResetCamera();
+    view.redraw();
+    window.copy_label(
+        (std::filesystem::path(path).filename().string() + " — VTK FLTK")
+            .c_str());
+    std::cout << "Loaded " << data->GetNumberOfPoints() << " points, "
+              << data->GetNumberOfCells() << " cells\n";
+  }
+  void show() {
+    window.xclass("vtk-fltk");
+    window.show();
+    desktop = std::make_unique<DesktopMenu>(window, menu);
+    if (!report_path.empty())
+      Fl::add_timeout(.1, tick, this);
+  }
+  static void tick(void *data) {
+    auto *self = static_cast<Viewer *>(data);
+    auto *input = self->mapper->GetInput();
+    auto *camera = self->renderer->GetActiveCamera()->GetPosition();
+    Json state = {
+        {"points", input ? input->GetNumberOfPoints() : 0},
+        {"cells", input ? input->GetNumberOfCells() : 0},
+        {"camera", {camera[0], camera[1], camera[2]}},
+        {"wireframe",
+         self->actor->GetProperty()->GetRepresentation() == VTK_WIREFRAME},
+        {"capture_complete", self->view.capture_complete()},
+        {"desktop_menu",
+         {{"service", self->desktop->serviceName()},
+          {"path", self->desktop->objectPath()}}}};
+    auto temporary = self->report_path + ".tmp";
+    {
+      std::ofstream out(temporary);
+      out << state.dump(2) << '\n';
     }
-    return Fl_Gl_Window::handle(event);
+    std::filesystem::rename(temporary, self->report_path);
+    if (self->window.shown())
+      Fl::repeat_timeout(.1, tick, self);
   }
 };
+} // namespace
 int main(int argc, char **argv) {
-  Window window;
-  if (argc > 1)
-    window.capture = argv[1];
-  window.show();
-  if (argc > 1)
-    Fl::add_timeout(
-        2, [](void *p) { static_cast<Window *>(p)->hide(); }, &window);
-  return Fl::run();
+  try {
+    std::string file, capture, report;
+    int duration = 0;
+    for (int i = 1; i < argc; ++i) {
+      std::string arg = argv[i];
+      if (arg == "--help") {
+        std::cout << "vtk-fltk [GEOMETRY] [--capture PPM] [--report JSON] "
+                     "[--quit-after-ms N]\n";
+        return 0;
+      }
+      if (arg == "--capture" && i + 1 < argc)
+        capture = argv[++i];
+      else if (arg == "--report" && i + 1 < argc)
+        report = argv[++i];
+      else if (arg == "--quit-after-ms" && i + 1 < argc)
+        duration = std::stoi(argv[++i]);
+      else if (arg.starts_with('-'))
+        throw std::runtime_error("Unknown or incomplete option: " + arg);
+      else if (file.empty())
+        file = arg;
+      else
+        throw std::runtime_error("Open one geometry file at a time");
+    }
+    if (!getenv("FLTK_BACKEND"))
+      setenv("FLTK_BACKEND", "wayland", 0);
+    dx::init();
+    Fl::lock();
+    Viewer viewer;
+    viewer.report_path = report;
+    if (!file.empty())
+      viewer.load(file);
+    if (!capture.empty())
+      viewer.view.capture(capture);
+    viewer.show();
+    if (duration > 0)
+      Fl::add_timeout(
+          duration / 1000., [](void *p) { static_cast<Viewer *>(p)->close(); },
+          &viewer);
+    int result = Fl::run();
+    if (!capture.empty() && !viewer.view.capture_complete())
+      throw std::runtime_error("No VTK frame captured");
+    return result;
+  } catch (const std::exception &e) {
+    std::cerr << "VTK FLTK: " << e.what() << '\n';
+    return 1;
+  }
 }
